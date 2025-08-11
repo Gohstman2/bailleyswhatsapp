@@ -1,8 +1,6 @@
-// Installations nécessaires :
-// npm install express baileys qrcode
-
+// Installation : npm install express baileys qrcode
 import express from 'express'
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from 'baileys'
+import { makeWASocket, useMultiFileAuthState, DisconnectReason } from 'baileys'
 import qrcode from 'qrcode'
 
 const app = express()
@@ -10,42 +8,47 @@ app.use(express.json())
 
 let sock
 let authenticated = false
+let lastQR = null
 
-// Initialisation de Baileys
+// Fonction d'initialisation de la connexion WhatsApp
 async function startSock() {
     const { state, saveCreds } = await useMultiFileAuthState('./auth_info')
+
     sock = makeWASocket({
         auth: state,
         printQRInTerminal: false
     })
 
+    // Événements connexion / QR code
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update
 
         if (qr) {
-            // Stocker le QR code pour /auth
-            lastQR = await qrcode.toDataURL(qr)
+            lastQR = await qrcode.toDataURL(qr) // Convertir le QR en base64
+            console.log('📱 QR code généré pour authentification')
         }
 
         if (connection === 'open') {
-            console.log('✅ Authentifié avec succès')
+            console.log('✅ Bot WhatsApp connecté')
             authenticated = true
         } else if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut
+            const reason = lastDisconnect?.error?.output?.statusCode
             authenticated = false
-            if (shouldReconnect) {
+            console.log(`⚠️ Connexion fermée (code: ${reason}), reconnexion...`)
+            if (reason !== DisconnectReason.loggedOut) {
                 startSock()
             }
         }
     })
 
+    // Sauvegarde de l'état d'authentification
     sock.ev.on('creds.update', saveCreds)
 }
 
-let lastQR = null
+// Démarrage initial
 startSock()
 
-// Route /auth → Retourne le QR en Base64
+// 📌 ROUTE : Authentification → retourne QR en base64
 app.get('/auth', (req, res) => {
     if (authenticated) {
         return res.json({ status: 'already_authenticated' })
@@ -56,12 +59,12 @@ app.get('/auth', (req, res) => {
     res.json({ qr: lastQR })
 })
 
-// Route /status → Renvoie l'état
+// 📌 ROUTE : Statut → authentifié ou non
 app.get('/status', (req, res) => {
     res.json({ authenticated })
 })
 
-// Route /message → Envoi un message
+// 📌 ROUTE : Envoi message
 app.post('/message', async (req, res) => {
     const { number, text } = req.body
     if (!authenticated) {
@@ -73,10 +76,12 @@ app.post('/message', async (req, res) => {
         res.json({ success: true })
     } catch (err) {
         console.error(err)
-        res.status(500).json({ error: 'Erreur envoi message' })
+        res.status(500).json({ error: 'Erreur lors de l\'envoi du message' })
     }
 })
 
-app.listen(3000, () => {
-    console.log('🚀 Serveur démarré sur http://localhost:3000')
+// Lancer le serveur
+const PORT = process.env.PORT || 3000
+app.listen(PORT, () => {
+    console.log(`🚀 Serveur démarré sur http://localhost:${PORT}`)
 })
