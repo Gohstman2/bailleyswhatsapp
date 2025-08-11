@@ -1,144 +1,100 @@
 import express from 'express'
 import axios from 'axios'
-import { makeWASocket, useMultiFileAuthState, DisconnectReason } from 'baileys'
-import fs from 'fs'
+import { makeWASocket, useMultiFileAuthState } from 'baileys'
 import path from 'path'
+import fs from 'fs'
 
 const app = express()
 app.use(express.json())
 
-// Stockage des clients : { idClient: { sock, authenticated, webhook, number } }
 const clients = {}
 
-// 📌 Fonction pour initialiser un client
-async function initClient(idClient, number) {
-    const authPath = path.join('./sessions', idClient)
-    if (!fs.existsSync(authPath)) fs.mkdirSync(authPath, { recursive: true })
+// Démarre et retourne un sock Baileys pour un client
+async function startClient(clientId, number) {
+  const authPath = path.join('./sessions', clientId)
+  if (!fs.existsSync(authPath)) fs.mkdirSync(authPath, { recursive: true })
 
-    const { state, saveCreds } = await useMultiFileAuthState(authPath)
-    const sock = makeWASocket({ auth: state, printQRInTerminal: false })
+  const { state, saveCreds } = await useMultiFileAuthState(authPath)
 
-    clients[idClient] = { sock, authenticated: false, webhook: null, number }
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+  })
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update
+  clients[clientId] = {
+    sock,
+    number,
+    pairingCode: null,
+    authenticated: false,
+    saveCreds,
+  }
 
-        // Génération pairing code au moment de la connexion
-        if (connection === 'connecting' && number) {
-            try {
-                const code = await sock.requestPairingCode(number)
-                clients[idClient].pairingCode = code
-                console.log(`📱 Pairing code pour ${idClient}: ${code}`)
-            } catch (err) {
-                console.error(`Erreur génération code:`, err)
-            }
-        }
+  sock.ev.on('creds.update', saveCreds)
 
-        if (connection === 'open') {
-            console.log(`✅ Client ${idClient} connecté`)
-            clients[idClient].authenticated = true
-        } else if (connection === 'close') {
-            const reason = lastDisconnect?.error?.output?.statusCode
-            clients[idClient].authenticated = false
-            if (reason !== DisconnectReason.loggedOut) {
-                initClient(idClient, number)
-            }
-        }
-    })
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect } = update
+    if (connection === 'open') {
+      clients[clientId].authenticated = true
+      clients[clientId].pairingCode = null
+      console.log(`Client ${clientId} connecté`)
+    } else if (connection === 'close') {
+      clients[clientId].authenticated = false
+      console.log(`Client ${clientId} déconnecté`)
+      // gérer reconnexion automatique si tu veux ici
+    }
+  })
 
-    // Sauvegarde des creds
-    sock.ev.on('creds.update', saveCreds)
-
-    // Gestion des messages entrants
-    sock.ev.on('messages.upsert', async (m) => {
-        const webhook = clients[idClient].webhook
-        if (!webhook) return
-        try {
-            await axios.post(webhook, { clientId: idClient, data: m })
-        } catch (err) {
-            console.error(`Erreur envoi webhook client ${idClient}:`, err.message)
-        }
-    })
+  return sock
 }
 
-// 📌 Route : AuthCode
+// Route pour générer pairing code et l’envoyer via API Python (send_whatsapp_message)
 app.post('/authcode', async (req, res) => {
-    const { id, number } = req.body
-    if (!id || !number) return res.status(400).json({ error: 'id et number requis' })
+  const { clientId, number, whatsappDestNumber } = req.body
+  if (!clientId || !number || !whatsappDestNumber) {
+    return res.status(400).json({ error: 'clientId, number et whatsappDestNumber requis' })
+  }
 
-    await initClient(id, number)
-    res.json({ status: 'client_initialised', id })
-})
+  try {
+    let client = clients[clientId]
 
-// 📌 Route : AuthStatus
-app.get('/authstatus/:id', (req, res) => {
-    const id = req.params.id
-    if (!clients[id]) return res.status(404).json({ error: 'client inexistant' })
-    res.json({ authenticated: clients[id].authenticated, pairingCode: clients[id].pairingCode || null })
-})
-
-// 📌 Route : Send message
-app.post('/send/message', async (req, res) => {
-    const { id, to, text } = req.body
-    if (!id || !to || !text) return res.status(400).json({ error: 'id, to et text requis' })
-    const client = clients[id]
-    if (!client || !client.authenticated) return res.status(401).json({ error: 'client non authentifié' })
-
-    try {
-        await client.sock.sendMessage(to + '@s.whatsapp.net', { text })
-        res.json({ success: true })
-    } catch (err) {
-        res.status(500).json({ error: err.message })
+    if (!client) {
+      const sock = await startClient(clientId, number)
+      client = clients[clientId]
+      client.sock = sock
     }
-})
 
-// 📌 Route : Send button
-app.post('/send/button', async (req, res) => {
-    const { id, to, text, buttons } = req.body
-    if (!id || !to || !text || !buttons) return res.status(400).json({ error: 'id, to, text, buttons requis' })
-    const client = clients[id]
-    if (!client || !client.authenticated) return res.status(401).json({ error: 'client non authentifié' })
-
-    try {
-        await client.sock.sendMessage(to + '@s.whatsapp.net', {
-            text,
-            buttons: buttons.map((b, idx) => ({ buttonId: `btn_${idx}`, buttonText: { displayText: b }, type: 1 })),
-            headerType: 1
-        })
-        res.json({ success: true })
-    } catch (err) {
-        res.status(500).json({ error: err.message })
+    if (client.authenticated) {
+      return res.status(400).json({ error: 'Client déjà authentifié' })
     }
-})
 
-// 📌 Route : Send media
-app.post('/send/media', async (req, res) => {
-    const { id, to, mediaPath, mimetype } = req.body
-    if (!id || !to || !mediaPath || !mimetype) return res.status(400).json({ error: 'id, to, mediaPath, mimetype requis' })
-    const client = clients[id]
-    if (!client || !client.authenticated) return res.status(401).json({ error: 'client non authentifié' })
+    // Générer le pairing code
+    const pairingCode = await client.sock.requestPairingCode(number)
+    client.pairingCode = pairingCode
+    console.log(`Pairing code pour client ${clientId}: ${pairingCode}`)
 
-    try {
-        const mediaBuffer = fs.readFileSync(mediaPath)
-        await client.sock.sendMessage(to + '@s.whatsapp.net', { document: mediaBuffer, mimetype })
-        res.json({ success: true })
-    } catch (err) {
-        res.status(500).json({ error: err.message })
+    // Appeler l’API Python pour envoyer ce code via WhatsApp
+    // Ex: POST http://localhost:5000/send-message { number: whatsappDestNumber, message: pairingCode }
+    const API_PYTHON_URL = 'https://senhatsappv3.onrender.com/sendMessage'
+
+    const message = `Votre code de couplage WhatsApp est : ${pairingCode}`
+
+    const response = await axios.post(API_PYTHON_URL, {
+      number: whatsappDestNumber,
+      message
+    }, { timeout: 15000 })
+
+    if (response.data.success) {
+      res.json({ success: true, pairingCode })
+    } else {
+      res.status(500).json({ error: 'Échec envoi message via API Python', details: response.data })
     }
-})
-
-// 📌 Route : Set webhook
-app.post('/setwebhook', (req, res) => {
-    const { id, webhook } = req.body
-    if (!id || !webhook) return res.status(400).json({ error: 'id et webhook requis' })
-    const client = clients[id]
-    if (!client) return res.status(404).json({ error: 'client inexistant' })
-
-    client.webhook = webhook
-    res.json({ success: true, webhook })
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: err.message })
+  }
 })
 
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {
-    console.log(`🚀 Serveur multi-clients WhatsApp démarré sur port ${PORT}`)
+  console.log(`Serveur démarré sur http://localhost:${PORT}`)
 })
