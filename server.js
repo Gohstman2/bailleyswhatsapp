@@ -1,95 +1,144 @@
 import express from 'express'
+import axios from 'axios'
 import { makeWASocket, useMultiFileAuthState, DisconnectReason } from 'baileys'
-import qrcode from 'qrcode'
+import fs from 'fs'
+import path from 'path'
 
 const app = express()
 app.use(express.json())
 
-let sock
-let authenticated = false
-let lastQR = null
-let pendingPairCode = null
-let pairPhone = null
+// Stockage des clients : { idClient: { sock, authenticated, webhook, number } }
+const clients = {}
 
-async function startSock() {
-  const { state, saveCreds } = await useMultiFileAuthState('./auth_info')
-  sock = makeWASocket({ auth: state, printQRInTerminal: false })
+// 📌 Fonction pour initialiser un client
+async function initClient(idClient, number) {
+    const authPath = path.join('./sessions', idClient)
+    if (!fs.existsSync(authPath)) fs.mkdirSync(authPath, { recursive: true })
 
-  sock.ev.on('connection.update', async update => {
-    const { connection, lastDisconnect, qr } = update
+    const { state, saveCreds } = await useMultiFileAuthState(authPath)
+    const sock = makeWASocket({ auth: state, printQRInTerminal: false })
 
-    if (qr) {
-      lastQR = await qrcode.toDataURL(qr)
-      console.log('QR généré')
-    }
+    clients[idClient] = { sock, authenticated: false, webhook: null, number }
 
-    // Si on attend un pairing code et que la connexion commence
-    if ((connection === 'connecting' || qr) && pairPhone && !pendingPairCode) {
-      const code = await sock.requestPairingCode(pairPhone)
-      pendingPairCode = code
-      console.log('Pairing code généré pour', pairPhone)
-    }
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update
 
-    if (connection === 'open') {
-      authenticated = true
-      pendingPairCode = null
-      pairPhone = null
-      console.log('Bot connecté via pairing ou QR !')
-    } else if (connection === 'close') {
-      authenticated = false
-      const reason = lastDisconnect?.error?.output?.statusCode
-      if (reason !== DisconnectReason.loggedOut) startSock()
-    }
-  })
+        // Génération pairing code au moment de la connexion
+        if (connection === 'connecting' && number) {
+            try {
+                const code = await sock.requestPairingCode(number)
+                clients[idClient].pairingCode = code
+                console.log(`📱 Pairing code pour ${idClient}: ${code}`)
+            } catch (err) {
+                console.error(`Erreur génération code:`, err)
+            }
+        }
 
-  sock.ev.on('creds.update', saveCreds)
+        if (connection === 'open') {
+            console.log(`✅ Client ${idClient} connecté`)
+            clients[idClient].authenticated = true
+        } else if (connection === 'close') {
+            const reason = lastDisconnect?.error?.output?.statusCode
+            clients[idClient].authenticated = false
+            if (reason !== DisconnectReason.loggedOut) {
+                initClient(idClient, number)
+            }
+        }
+    })
+
+    // Sauvegarde des creds
+    sock.ev.on('creds.update', saveCreds)
+
+    // Gestion des messages entrants
+    sock.ev.on('messages.upsert', async (m) => {
+        const webhook = clients[idClient].webhook
+        if (!webhook) return
+        try {
+            await axios.post(webhook, { clientId: idClient, data: m })
+        } catch (err) {
+            console.error(`Erreur envoi webhook client ${idClient}:`, err.message)
+        }
+    })
 }
 
-startSock()
+// 📌 Route : AuthCode
+app.post('/authcode', async (req, res) => {
+    const { id, number } = req.body
+    if (!id || !number) return res.status(400).json({ error: 'id et number requis' })
 
-// Route QR classique
-app.get('/auth', (req, res) => {
-  if (authenticated) return res.json({ status: 'already_authenticated' })
-  if (!lastQR) return res.json({ status: 'waiting_for_qr' })
-  res.json({ qr: lastQR })
+    await initClient(id, number)
+    res.json({ status: 'client_initialised', id })
 })
 
-// Route pairing via numéro
-app.post('/authcode', (req, res) => {
-  const { number } = req.body
-  if (!number) return res.status(400).json({ error: 'number required' })
-
-  pairPhone = number
-  pendingPairCode = null
-  res.json({ status: 'requesting_code' })
+// 📌 Route : AuthStatus
+app.get('/authstatus/:id', (req, res) => {
+    const id = req.params.id
+    if (!clients[id]) return res.status(404).json({ error: 'client inexistant' })
+    res.json({ authenticated: clients[id].authenticated, pairingCode: clients[id].pairingCode || null })
 })
 
-app.get('/authcode/status', (req, res) => {
-  if (!pairPhone) return res.json({ status: 'no_request' })
-  if (pendingPairCode) {
-    return res.json({ status: 'code_ready', code: pendingPairCode })
-  }
-  res.json({ status: 'waiting_code' })
+// 📌 Route : Send message
+app.post('/send/message', async (req, res) => {
+    const { id, to, text } = req.body
+    if (!id || !to || !text) return res.status(400).json({ error: 'id, to et text requis' })
+    const client = clients[id]
+    if (!client || !client.authenticated) return res.status(401).json({ error: 'client non authentifié' })
+
+    try {
+        await client.sock.sendMessage(to + '@s.whatsapp.net', { text })
+        res.json({ success: true })
+    } catch (err) {
+        res.status(500).json({ error: err.message })
+    }
 })
 
-// Route status
-app.get('/status', (req, res) => {
-  res.json({ authenticated })
-}) 
+// 📌 Route : Send button
+app.post('/send/button', async (req, res) => {
+    const { id, to, text, buttons } = req.body
+    if (!id || !to || !text || !buttons) return res.status(400).json({ error: 'id, to, text, buttons requis' })
+    const client = clients[id]
+    if (!client || !client.authenticated) return res.status(401).json({ error: 'client non authentifié' })
 
-// Envoi de message
-app.post('/message', async (req, res) => {
-  const { number, text } = req.body
-  if (!authenticated) return res.status(401).json({ error: 'Bot non authentifié' })
-  try {
-    const jid = number + '@s.whatsapp.net'
-    await sock.sendMessage(jid, { text })
-    res.json({ success: true })
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: 'Erreur envoi message' })
-  }
+    try {
+        await client.sock.sendMessage(to + '@s.whatsapp.net', {
+            text,
+            buttons: buttons.map((b, idx) => ({ buttonId: `btn_${idx}`, buttonText: { displayText: b }, type: 1 })),
+            headerType: 1
+        })
+        res.json({ success: true })
+    } catch (err) {
+        res.status(500).json({ error: err.message })
+    }
+})
+
+// 📌 Route : Send media
+app.post('/send/media', async (req, res) => {
+    const { id, to, mediaPath, mimetype } = req.body
+    if (!id || !to || !mediaPath || !mimetype) return res.status(400).json({ error: 'id, to, mediaPath, mimetype requis' })
+    const client = clients[id]
+    if (!client || !client.authenticated) return res.status(401).json({ error: 'client non authentifié' })
+
+    try {
+        const mediaBuffer = fs.readFileSync(mediaPath)
+        await client.sock.sendMessage(to + '@s.whatsapp.net', { document: mediaBuffer, mimetype })
+        res.json({ success: true })
+    } catch (err) {
+        res.status(500).json({ error: err.message })
+    }
+})
+
+// 📌 Route : Set webhook
+app.post('/setwebhook', (req, res) => {
+    const { id, webhook } = req.body
+    if (!id || !webhook) return res.status(400).json({ error: 'id et webhook requis' })
+    const client = clients[id]
+    if (!client) return res.status(404).json({ error: 'client inexistant' })
+
+    client.webhook = webhook
+    res.json({ success: true, webhook })
 })
 
 const PORT = process.env.PORT || 3000
-app.listen(PORT, () => console.log(`Serveur lancé sur port ${PORT}`))
+app.listen(PORT, () => {
+    console.log(`🚀 Serveur multi-clients WhatsApp démarré sur port ${PORT}`)
+})
