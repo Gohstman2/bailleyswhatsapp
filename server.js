@@ -75,7 +75,7 @@ app.get('/authcode/status', (req, res) => {
 // Route status
 app.get('/status', (req, res) => {
   res.json({ authenticated })
-})
+}) 
 
 // Envoi de message
 app.post('/message', async (req, res) => {
