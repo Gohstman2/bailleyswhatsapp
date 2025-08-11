@@ -1,96 +1,66 @@
 import express from 'express'
-import axios from 'axios'
-import { makeWASocket, useMultiFileAuthState } from 'baileys'
-import path from 'path'
+import { makeWASocket, useSingleFileAuthState, DisconnectReason } from 'baileys'
 import fs from 'fs'
 
 const app = express()
 app.use(express.json())
 
-const clients = {}
+const SESSION_FILE = './auth_info.json'
 
-// Démarre et retourne un sock Baileys pour un client
-async function startClient(clientId, number) {
-  const authPath = path.join('./sessions', clientId)
-  if (!fs.existsSync(authPath)) fs.mkdirSync(authPath, { recursive: true })
+// Utilisation d’une session unique stockée dans un fichier
+const { state, saveState } = useSingleFileAuthState(SESSION_FILE)
 
-  const { state, saveCreds } = await useMultiFileAuthState(authPath)
+let sock = null
 
-  const sock = makeWASocket({
+async function startSock() {
+  sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false,
+    printQRInTerminal: true,
   })
-
-  clients[clientId] = {
-    sock,
-    number,
-    pairingCode: null,
-    authenticated: false,
-    saveCreds,
-  }
-
-  sock.ev.on('creds.update', saveCreds)
 
   sock.ev.on('connection.update', (update) => {
+    console.log('Connection update:', update)
     const { connection, lastDisconnect } = update
-    if (connection === 'open') {
-      clients[clientId].authenticated = true
-      clients[clientId].pairingCode = null
-      console.log(`Client ${clientId} connecté`)
-    } else if (connection === 'close') {
-      clients[clientId].authenticated = false
-      console.log(`Client ${clientId} déconnecté`)
-      // gérer reconnexion automatique si tu veux ici
+    if (connection === 'close') {
+      const reason = (lastDisconnect.error)?.output?.statusCode
+      console.log('Connexion fermée, raison:', reason)
+
+      // Si pas déconnecté volontairement, reconnecte
+      if (reason !== DisconnectReason.loggedOut) {
+        console.log('Tentative de reconnexion...')
+        startSock()
+      } else {
+        console.log('Déconnecté volontairement, pas de reconnexion.')
+      }
+    } else if (connection === 'open') {
+      console.log('Connecté avec succès !')
     }
   })
 
-  return sock
+  sock.ev.on('creds.update', saveState)
 }
 
-// Route pour générer pairing code et l’envoyer via API Python (send_whatsapp_message)
+await startSock()
+
+// Route pour générer pairing code et le renvoyer dans la réponse
 app.post('/authcode', async (req, res) => {
-  const { clientId, number, whatsappDestNumber } = req.body
-  if (!clientId || !number || !whatsappDestNumber) {
-    return res.status(400).json({ error: 'clientId, number et whatsappDestNumber requis' })
-  }
-
   try {
-    let client = clients[clientId]
+    if (!sock) return res.status(500).json({ error: 'Socket non initialisé' })
 
-    if (!client) {
-      const sock = await startClient(clientId, number)
-      client = clients[clientId]
-      client.sock = sock
+    const { number } = req.body
+    if (!number) return res.status(400).json({ error: 'number requis' })
+
+    if (sock.authState?.creds?.me) {
+      return res.status(400).json({ error: 'Déjà authentifié' })
     }
 
-    if (client.authenticated) {
-      return res.status(400).json({ error: 'Client déjà authentifié' })
-    }
+    const pairingCode = await sock.requestPairingCode(number)
+    console.log('Pairing code généré:', pairingCode)
 
-    // Générer le pairing code
-    const pairingCode = await client.sock.requestPairingCode(number)
-    client.pairingCode = pairingCode
-    console.log(`Pairing code pour client ${clientId}: ${pairingCode}`)
-
-    // Appeler l’API Python pour envoyer ce code via WhatsApp
-    // Ex: POST http://localhost:5000/send-message { number: whatsappDestNumber, message: pairingCode }
-    const API_PYTHON_URL = 'https://senhatsappv3.onrender.com/sendMessage'
-
-    const message = `Votre code de couplage WhatsApp est : ${pairingCode}`
-
-    const response = await axios.post(API_PYTHON_URL, {
-      number: whatsappDestNumber,
-      message
-    }, { timeout: 15000 })
-
-    if (response.data.success) {
-      res.json({ success: true, pairingCode })
-    } else {
-      res.status(500).json({ error: 'Échec envoi message via API Python', details: response.data })
-    }
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: err.message })
+    res.json({ pairingCode })
+  } catch (error) {
+    console.error('Erreur génération pairing code:', error)
+    res.status(500).json({ error: error.message })
   }
 })
 
