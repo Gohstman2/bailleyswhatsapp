@@ -1,6 +1,6 @@
 import express from 'express'
 import axios from 'axios'
-import makeWASocket, { useMultiFileAuthState } from '@whiskeysockets/baileys'
+import makeWASocket, {makeWASocket, useMultiFileAuthState } from '@whiskeysockets/baileys'
 
 const app = express()
 app.use(express.json())
