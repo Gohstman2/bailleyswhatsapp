@@ -1,70 +1,59 @@
 import express from 'express'
-import { makeWASocket, useMultiFileAuthState, DisconnectReason } from 'baileys'
-import path from 'path'
+import axios from 'axios'
+import makeWASocket, { useMultiFileAuthState } from '@whiskeysockets/baileys'
 
 const app = express()
 app.use(express.json())
 
-const authFolder = './auth_info'
+app.post('/create-pairing', async (req, res) => {
+  const { number, whatsappDestNumber } = req.body
 
-let sock = null
+  if (!number || !whatsappDestNumber) {
+    return res.status(400).json({ error: 'number et whatsappDestNumber sont requis' })
+  }
 
-async function startSock() {
-  const { state, saveCreds } = await useMultiFileAuthState(authFolder)
-
-  sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: true,
-  })
-
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update
-    console.log('Connection update:', connection)
-
-    if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode
-      console.log('Connexion fermée, raison:', statusCode)
-
-      if (statusCode !== DisconnectReason.loggedOut) {
-        console.log('Tentative de reconnexion...')
-        startSock()
-      } else {
-        console.log('Déconnecté volontairement, pas de reconnexion.')
-      }
-    } else if (connection === 'open') {
-      console.log('Connecté avec succès !')
-    }
-  })
-
-  sock.ev.on('creds.update', saveCreds)
-}
-
-await startSock()
-
-// Route POST /authcode pour générer le pairing code
-app.post('/authcode', async (req, res) => {
   try {
-    if (!sock) return res.status(500).json({ error: 'Socket non initialisé' })
+    // Initialiser l'auth pour ce numéro
+    const { state, saveCreds } = await useMultiFileAuthState(`auth-${number}`)
+    const sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      browser: ['MyApp', 'Chrome', '1.0.0']
+    })
 
-    const { number } = req.body
-    if (!number) return res.status(400).json({ error: 'number requis' })
+    sock.ev.on('creds.update', saveCreds)
 
-    // Vérifie si déjà connecté
-    if (sock.authState?.creds?.me) {
-      return res.status(400).json({ error: 'Déjà authentifié' })
+    let pairingCode = null
+
+    // Générer le pairing code si non enregistré
+    if (!sock.authState.creds.registered) {
+      pairingCode = await sock.requestPairingCode(number)
+      console.log(`Pairing code généré : ${pairingCode}`)
+
+      // Envoyer via API Python
+      const API_PYTHON_URL = 'https://senhatsappv3.onrender.com/sendMessage'
+      const message = `Votre code de couplage WhatsApp est : ${pairingCode}`
+
+      const response = await axios.post(API_PYTHON_URL, {
+        number: whatsappDestNumber,
+        message
+      }, { timeout: 15000 })
+
+      if (!response.data.success) {
+        return res.status(500).json({
+          error: 'Échec envoi message via API Python',
+          details: response.data
+        })
+      }
     }
 
-    const pairingCode = await sock.requestPairingCode(number)
-    console.log('Pairing code généré:', pairingCode)
-
-    res.json({ pairingCode })
-  } catch (error) {
-    console.error('Erreur génération pairing code:', error)
-    res.status(500).json({ error: error.message })
+    return res.json({ success: true, pairingCode })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: err.message })
   }
 })
 
-const PORT = process.env.PORT || 3000
-app.listen(PORT, () => {
-  console.log(`Serveur démarré sur http://localhost:${PORT}`)
+app.listen(5000, () => {
+  console.log('Serveur démarré sur http://localhost:5000')
 })
