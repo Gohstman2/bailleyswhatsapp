@@ -1,15 +1,11 @@
 {
   "name": "whatsapp-server",
   "version": "1.0.0",
-  "description": "Serveur Express pour WhatsApp via Baileys",
-  "main": "server.js",
   "type": "module",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "keywords": ["whatsapp", "baileys", "express", "qr", "messages"],
-  "author": "TonNom",
-  "license": "MIT",
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.18",
     "express": "^4.18.2",
