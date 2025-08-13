@@ -1,7 +1,7 @@
 import express from 'express';
-import makeWASocket, { useMultiFileAuthState } from '@whiskeysockets/baileys';
 import P from 'pino';
 import QRCode from 'qrcode';
+import { default as makeWASocket, useSingleFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } from '@whiskeysockets/baileys';
 
 const app = express();
 app.use(express.json());
@@ -13,20 +13,28 @@ let client = null;
 // Initialise le client WhatsApp
 async function initClient() {
   if (!client) {
-    const { state, saveCreds } = await useMultiFileAuthState('./auth_sessions');
+    const { state, saveCreds } = await useSingleFileAuthState('./auth_info.json');
+    const { version } = await fetchLatestBaileysVersion();
 
     client = makeWASocket({
       auth: state,
       logger: P({ level: 'debug' }),
+      version,
+      printQRInTerminal: false,
+      browser: Browsers.macOS('Desktop'),
     });
 
     client.ev.on('creds.update', saveCreds);
 
-    client.ev.on('connection.update', (update) => {
+    client.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
-      if (qr) client.qrCode = qr;
+
+      if (qr) {
+        client.qrCode = qr;
+      }
+
       if (connection === 'close') {
-        if ((lastDisconnect?.error)?.output?.statusCode !== 401) {
+        if ((lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut) {
           console.log('Reconnexion...');
           client = null;
           initClient();
@@ -36,7 +44,7 @@ async function initClient() {
   }
 }
 
-// Route pour auth : retourne QR code ou status authenticated
+// Route pour auth : retourne QR code ou statut authenticated
 app.get('/auth', async (req, res) => {
   await initClient();
 
